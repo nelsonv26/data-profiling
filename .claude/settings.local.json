@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(New-Item -ItemType Directory -Force \"D:\\\\Adoreal\\\\data-profiling\\\\dataprofile\")",
+      "Bash(python -c ' *)"
+    ]
+  }
+}
