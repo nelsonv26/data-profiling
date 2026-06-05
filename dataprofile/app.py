@@ -16,6 +16,7 @@ import streamlit as st
 from profiler import (
     auto_detect_dob_columns,
     auto_detect_date_columns,
+    auto_detect_biz_key_columns,
     profile_dataframe,
 )
 from report import build_excel_report, build_json_report
@@ -70,26 +71,110 @@ with st.sidebar:
 # Helper: load uploaded file
 # ---------------------------------------------------------------------------
 
+_CSV_ENCODINGS = ["utf-8", "latin-1", "cp1252", "iso-8859-1"]
+_EXCEL_CHUNK_ROWS = 10_000
+_LARGE_FILE_MB = 50
+
+
+def _load_csv(uploaded) -> pd.DataFrame:
+    raw = uploaded.read()
+    last_enc_error: Exception | None = None
+    for enc in _CSV_ENCODINGS:
+        try:
+            return pd.read_csv(io.BytesIO(raw), encoding=enc, low_memory=False)
+        except (UnicodeDecodeError, LookupError) as exc:
+            # Only retry on encoding-related failures
+            last_enc_error = exc
+            continue
+        except Exception:
+            # Non-encoding error: re-try with next encoding won't help, but
+            # try anyway — some parsers emit generic errors on bad encoding
+            last_enc_error = None
+            break
+    if last_enc_error is not None:
+        raise ValueError(
+            f"Could not decode CSV with any of: {', '.join(_CSV_ENCODINGS)}"
+        ) from last_enc_error
+    # Re-read with a lenient engine so we surface the real parse error
+    try:
+        return pd.read_csv(io.BytesIO(raw), encoding="latin-1", low_memory=False, on_bad_lines="warn")
+    except Exception as exc:
+        raise ValueError(f"CSV parse error: {exc}") from exc
+
+
+def _load_excel(uploaded) -> tuple[pd.DataFrame, str]:
+    """Return (dataframe, sheet_name). Chunks large files to avoid OOM."""
+    raw = uploaded.read()
+    name = uploaded.name
+
+    try:
+        xls = pd.ExcelFile(io.BytesIO(raw), engine="openpyxl")
+    except Exception as exc:
+        raise RuntimeError(f"Cannot open Excel file: {exc}") from exc
+
+    sheets = xls.sheet_names
+    if len(sheets) == 1:
+        selected_sheet = sheets[0]
+    else:
+        selected_sheet = st.selectbox(
+            "This Excel file has multiple sheets — select one to profile:",
+            options=sheets,
+            key="sheet_selector",
+        )
+
+    file_mb = len(raw) / (1024 ** 2)
+    if file_mb > _LARGE_FILE_MB:
+        # Read in chunks to avoid openpyxl OOM on very large sheets
+        chunks: list[pd.DataFrame] = []
+        skiprows = 0
+        header_row: list | None = None
+        while True:
+            try:
+                chunk = xls.parse(
+                    selected_sheet,
+                    skiprows=skiprows if skiprows == 0 else skiprows + 1,
+                    nrows=_EXCEL_CHUNK_ROWS,
+                    header=0 if skiprows == 0 else None,
+                )
+            except Exception:
+                break
+            if chunk.empty:
+                break
+            if skiprows == 0:
+                header_row = list(chunk.columns)
+            else:
+                chunk.columns = header_row  # type: ignore[assignment]
+            chunks.append(chunk)
+            skiprows += _EXCEL_CHUNK_ROWS
+            if len(chunk) < _EXCEL_CHUNK_ROWS:
+                break
+        df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
+    else:
+        df = xls.parse(selected_sheet)
+
+    sheet_label = f"{name.rsplit('.', 1)[0]}_{selected_sheet}"
+    return df, sheet_label
+
+
 def _load_uploaded_file(uploaded) -> tuple[pd.DataFrame, str]:
     name: str = uploaded.name
+    file_mb = uploaded.size / (1024 ** 2)
+
+    if file_mb > _LARGE_FILE_MB:
+        st.warning(
+            f"Large file detected ({file_mb:.1f} MB). "
+            "Loading may take a moment. Files over 50 MB may be slow to process."
+        )
+
     if name.lower().endswith(".csv"):
-        df = pd.read_csv(uploaded, low_memory=False)
+        uploaded.seek(0)
+        df = _load_csv(uploaded)
         return df, name.rsplit(".", 1)[0]
 
     # Excel
-    xls = pd.ExcelFile(uploaded, engine="openpyxl")
-    sheets = xls.sheet_names
-    if len(sheets) == 1:
-        df = xls.parse(sheets[0])
-        return df, f"{name.rsplit('.', 1)[0]}_{sheets[0]}"
-
-    selected_sheet = st.selectbox(
-        "This Excel file has multiple sheets — select one to profile:",
-        options=sheets,
-        key="sheet_selector",
-    )
-    df = xls.parse(selected_sheet)
-    return df, f"{name.rsplit('.', 1)[0]}_{selected_sheet}"
+    uploaded.seek(0)
+    df, sheet_label = _load_excel(uploaded)
+    return df, sheet_label
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +199,6 @@ def _redshift_engine(host, port, database, user, password):
 
         url = f"redshift+redshift_connector://{user}:{password}@{host}:{port}/{database}"
         engine = create_engine(url, connect_args={"sslmode": "require"})
-        # Test connection
         with engine.connect() as conn:
             conn.execute(_text("SELECT 1"))
         return engine
@@ -174,6 +258,9 @@ if source == "Upload file (CSV / Excel)":
     )
 
     if uploaded:
+        file_mb = uploaded.size / (1024 ** 2)
+        st.caption(f"File size: **{file_mb:.2f} MB**")
+
         with st.spinner("Reading file…"):
             try:
                 df, tname = _load_uploaded_file(uploaded)
@@ -244,7 +331,7 @@ df: pd.DataFrame | None = st.session_state["df"]
 if df is not None:
     st.subheader(f"📋 Preview — {st.session_state['table_name']}")
     st.markdown(f"**{len(df):,} rows × {len(df.columns)} columns**")
-    st.dataframe(df.head(20), use_container_width=True)
+    st.dataframe(df.head(20), width='stretch')
 
     with st.expander("Column list with detected types", expanded=False):
         type_rows = []
@@ -256,7 +343,7 @@ if df is not None:
                 "Non-null Count": int(df[col].notna().sum()),
                 "Null %": round(df[col].isna().mean() * 100, 2),
             })
-        st.dataframe(pd.DataFrame(type_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(type_rows), width='stretch', hide_index=True)
 
     st.divider()
 
@@ -281,26 +368,58 @@ if df is not None:
     st.divider()
 
     # ---------------------------------------------------------------------------
-    # Step 4 — Run profiler
+    # Step 4 — Business key column selection
     # ---------------------------------------------------------------------------
 
-    if st.button("▶ Run Profiler", type="primary", use_container_width=True):
+    st.subheader("🔑 Business key columns")
+    st.markdown(
+        "Select columns that together form a unique patient/record identity "
+        "(e.g. phone, email, ID number). Records sharing the same combination "
+        "of values in these columns will be flagged as **business-key duplicates**."
+    )
+
+    auto_bk = auto_detect_biz_key_columns(df)
+    confirmed_bk = st.multiselect(
+        "Business key columns",
+        options=list(df.columns),
+        default=[c for c in auto_bk if c in df.columns],
+        help=(
+            "Auto-detected from column names containing: phone, email, id, number, "
+            "nombre, name, correo, telefono, etc."
+        ),
+    )
+
+    st.divider()
+
+    # ---------------------------------------------------------------------------
+    # Step 5 — Run profiler
+    # ---------------------------------------------------------------------------
+
+    if st.button("▶ Run Profiler", type="primary", width='stretch'):
         with st.spinner("Profiling data…"):
             result = profile_dataframe(
                 df=df,
                 table_name=st.session_state["table_name"],
                 dob_columns=confirmed_dobs,
+                biz_key_columns=confirmed_bk,
             )
             st.session_state["profile_result"] = result
 
 # ---------------------------------------------------------------------------
-# Step 5 — Results
+# Step 6 — Results
 # ---------------------------------------------------------------------------
 
 result: dict[str, Any] | None = st.session_state["profile_result"]
 
 if result is not None:
     st.subheader("📊 Profiling Results")
+
+    # Narrative summary
+    narrative = result.get("narrative", "")
+    if narrative:
+        st.info(narrative)
+
+    st.divider()
 
     gate = result["quality_gate"]
 
@@ -321,11 +440,27 @@ if result is not None:
                 st.markdown(f"- {warn}")
 
     # Summary metrics
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Total Records", f"{result['total_records']:,}")
     col2.metric("Total Columns", result["total_columns"])
-    col3.metric("Duplicate Records", f"{result['duplicate_count']:,}")
-    col4.metric("Duplicate %", f"{result['duplicate_pct']:.2f}%")
+    col3.metric("Full-row Duplicates", f"{result['duplicate_count']:,}",
+                delta=f"{result['duplicate_pct']:.2f}%",
+                delta_color="inverse")
+
+    bk_count = result.get("biz_key_duplicate_count", 0)
+    bk_pct = result.get("biz_key_duplicate_pct", 0.0)
+    bk_cols = result.get("biz_key_columns", [])
+    col4.metric(
+        "Biz-key Duplicates",
+        f"{bk_count:,}",
+        delta=f"{bk_pct:.2f}%" if bk_cols else "no key set",
+        delta_color="inverse" if bk_cols else "off",
+        help=(
+            f"Records sharing the same value in: {', '.join(bk_cols)}"
+            if bk_cols else "No business key columns selected."
+        ),
+    )
+    col5.metric("Columns", result["total_columns"])
 
     st.divider()
 
@@ -383,16 +518,16 @@ if result is not None:
         styled = df_to_style.style
         for col_name in ["Null %", "DOB >100y %", "DOB <18y %"]:
             if col_name in df_to_style.columns:
-                styled = styled.applymap(
+                styled = styled.map(
                     lambda v, cn=col_name: _highlight_cell(v, cn),
                     subset=[col_name],
                 )
         return styled
 
-    st.dataframe(_style_df(results_df), use_container_width=True, hide_index=True)
+    st.dataframe(_style_df(results_df), width='stretch', hide_index=True)
 
     # ---------------------------------------------------------------------------
-    # Step 6 — Downloads
+    # Step 7 — Downloads
     # ---------------------------------------------------------------------------
 
     st.divider()
@@ -407,7 +542,7 @@ if result is not None:
             data=json_bytes,
             file_name=f"dataprofiler_{result['table_name'].replace('/', '_')}.json",
             mime="application/json",
-            use_container_width=True,
+            width='stretch',
         )
 
     with col_dl2:
@@ -418,5 +553,5 @@ if result is not None:
             data=excel_bytes,
             file_name=f"dataprofiler_{result['table_name'].replace('/', '_')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
+            width='stretch',
         )

@@ -118,6 +118,97 @@ def auto_detect_date_columns(df: pd.DataFrame) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Business key column auto-detection
+# ---------------------------------------------------------------------------
+
+_BIZ_KEY_PATTERNS = re.compile(
+    r"(phone|telefono|tel[eé]fono|email|correo|"
+    r"\bid\b|_id$|^id_|number|numero|n[uú]mero|nombre|name)",
+    re.IGNORECASE,
+)
+
+
+def auto_detect_biz_key_columns(df: pd.DataFrame) -> list[str]:
+    """Return column names that are likely identity/business-key fields."""
+    return [c for c in df.columns if _BIZ_KEY_PATTERNS.search(c)]
+
+
+# ---------------------------------------------------------------------------
+# Narrative summary
+# ---------------------------------------------------------------------------
+
+_FRIENDLY_NAMES: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"email|correo", re.I), "email address"),
+    (re.compile(r"phone|tel[eé]?fono|tel", re.I), "phone number"),
+    (re.compile(r"home.*phone|phone.*home|tel.*casa|casa.*tel", re.I), "home phone number"),
+    (re.compile(r"cell|mobile|m[oó]vil|celular", re.I), "mobile phone number"),
+    (re.compile(r"birth|dob|nacimiento|fecha_nac", re.I), "birth date"),
+    (re.compile(r"address|direcci[oó]n|domicilio|addr", re.I), "address"),
+    (re.compile(r"zip|postal|c[oó]digo_postal", re.I), "postal code"),
+    (re.compile(r"nombre|name", re.I), "name"),
+    (re.compile(r"gender|sex|g[eé]nero|sexo", re.I), "gender"),
+    (re.compile(r"id\b|identifier|identificador", re.I), "identifier"),
+]
+
+
+def _friendly_column_name(col: str) -> str:
+    for pattern, label in _FRIENDLY_NAMES:
+        if pattern.search(col):
+            return label
+    return col.replace("_", " ").strip()
+
+
+def generate_narrative_summary(result: dict[str, Any]) -> str:
+    """
+    Build a plain-English paragraph summarising key data quality findings.
+    Only mentions columns where null% > 5%.
+    """
+    total = result["total_records"]
+    entity = "records"  # generic; callers can override
+
+    lines: list[str] = []
+    lines.append(f"This dataset contains {total:,} {entity}.")
+
+    seen_labels: set[str] = set()
+    for cp in result["columns"]:
+        if cp["null_pct"] <= 5:
+            continue
+        null_count = cp["null_count"]
+        null_pct = cp["null_pct"]
+        label = _friendly_column_name(cp["column"])
+        if label in seen_labels:
+            continue
+        seen_labels.add(label)
+
+        pct_str = f"{null_pct:.1f}%"
+        # Express as "1 in N" when that reads more naturally (5–30%)
+        if 5 < null_pct < 30:
+            ratio = round(100 / null_pct)
+            fraction = f"1 in {ratio} {entity} ({pct_str})"
+            lines.append(
+                f"{fraction} {'has' if total == 1 else 'have'} no {label} recorded."
+            )
+        else:
+            lines.append(
+                f"{null_count:,} {entity} ({pct_str}) have no {label} recorded."
+            )
+
+    # Business-key duplicates
+    bk_count = result.get("biz_key_duplicate_count")
+    bk_cols = result.get("biz_key_columns", [])
+    if bk_count and bk_count > 0 and bk_cols:
+        bk_pct = result.get("biz_key_duplicate_pct", 0)
+        key_label = " + ".join(_friendly_column_name(c) for c in bk_cols[:2])
+        if len(bk_cols) > 2:
+            key_label += " …"
+        lines.append(
+            f"{bk_count:,} {entity} ({bk_pct:.1f}%) share a duplicate business key ({key_label})."
+        )
+
+    return " ".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Core profiling
 # ---------------------------------------------------------------------------
 
@@ -131,19 +222,34 @@ def profile_dataframe(
     df: pd.DataFrame,
     table_name: str,
     dob_columns: list[str],
+    biz_key_columns: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     Profile a DataFrame and return a structured result dict.
 
     Parameters
     ----------
-    df          : The data to profile.
-    table_name  : Friendly name for the table/file.
-    dob_columns : Columns confirmed as date-of-birth fields.
+    df              : The data to profile.
+    table_name      : Friendly name for the table/file.
+    dob_columns     : Columns confirmed as date-of-birth fields.
+    biz_key_columns : Columns used as composite business key for dup detection.
     """
+    biz_key_columns = biz_key_columns or []
+
     total_records = len(df)
+
+    # Full-row duplicates
     duplicate_count = int(df.duplicated().sum())
     duplicate_pct = round(duplicate_count / max(total_records, 1) * 100, 2)
+
+    # Business-key duplicates
+    valid_bk_cols = [c for c in biz_key_columns if c in df.columns]
+    if valid_bk_cols:
+        bk_mask = df.duplicated(subset=valid_bk_cols, keep=False)
+        bk_dup_count = int(bk_mask.sum())
+    else:
+        bk_dup_count = 0
+    bk_dup_pct = round(bk_dup_count / max(total_records, 1) * 100, 2)
 
     # Detect all date columns (excluding confirmed DOB cols, to avoid double-counting)
     all_date_cols = auto_detect_date_columns(df)
@@ -170,7 +276,6 @@ def profile_dataframe(
         if col in dob_columns:
             dt_series = _coerce_datetime(series)
             non_null = dt_series.dropna()
-            n = max(len(non_null), 1)
 
             over_100_count = int((non_null < HUNDRED_YEARS_AGO).sum())
             under_18_count = int((non_null > EIGHTEEN_YEARS_AGO).sum())
@@ -197,6 +302,12 @@ def profile_dataframe(
     if duplicate_pct > 5:
         errors.append(f"Duplicate records: {duplicate_pct:.2f}% (threshold: >5%)")
 
+    if valid_bk_cols and bk_dup_pct > 5:
+        errors.append(
+            f"Business-key duplicates: {bk_dup_pct:.2f}% records share the same "
+            f"{' + '.join(valid_bk_cols)} (threshold: >5%)"
+        )
+
     for cp in columns_profile:
         if cp["null_pct"] > 20:
             errors.append(f"Column '{cp['column']}': {cp['null_pct']:.2f}% nulls (threshold: >20%)")
@@ -211,12 +322,15 @@ def profile_dataframe(
 
     gate_status = "PASS" if not errors else "FAIL"
 
-    return {
+    result: dict[str, Any] = {
         "table_name": table_name,
         "total_records": total_records,
         "total_columns": len(df.columns),
         "duplicate_count": duplicate_count,
         "duplicate_pct": duplicate_pct,
+        "biz_key_columns": valid_bk_cols,
+        "biz_key_duplicate_count": bk_dup_count,
+        "biz_key_duplicate_pct": bk_dup_pct,
         "dob_columns": dob_columns,
         "columns": columns_profile,
         "quality_gate": {
@@ -226,3 +340,6 @@ def profile_dataframe(
         },
         "profiled_at": datetime.utcnow().isoformat() + "Z",
     }
+
+    result["narrative"] = generate_narrative_summary(result)
+    return result
