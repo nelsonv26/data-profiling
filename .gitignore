@@ -41,3 +41,7 @@ desktop.ini
 *.log
 *.tmp
 *.bak
+
+data-profiling.tar
+*.xlsx
+*.json
