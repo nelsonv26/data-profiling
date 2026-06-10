@@ -1,0 +1,9 @@
+dataprofile/venv/
+dataprofile/.venv/
+dataprofile/__pycache__/
+dataprofile/*.pyc
+dataprofile/.env
+charts/
+.git/
+.claude/
+*.md

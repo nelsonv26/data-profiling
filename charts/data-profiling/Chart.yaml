@@ -1,0 +1,6 @@
+apiVersion: v2
+name: data-profiling
+description: DataProfiler — ERP to BC migration QA tool
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

@@ -1,0 +1,31 @@
+replicaCount: 1
+
+namespace: data-profiling
+
+image:
+  repository: data-profiling
+  tag: latest
+  # Use Never for local Docker Desktop (image already loaded locally).
+  # Override to Always when pushing to a remote registry.
+  pullPolicy: Never
+
+service:
+  type: ClusterIP
+  port: 8501
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# Redshift credentials injected as environment variables.
+# Override at deploy time with --set env.REDSHIFT_HOST=... or via a values override file.
+env:
+  REDSHIFT_HOST: ""
+  REDSHIFT_PORT: "5439"
+  REDSHIFT_DB: ""
+  REDSHIFT_USER: ""
+  REDSHIFT_PASSWORD: ""

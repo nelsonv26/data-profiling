@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "data-profiling.fullname" . }}-env
+  namespace: {{ .Values.namespace }}
+data:
+  REDSHIFT_HOST:     {{ .Values.env.REDSHIFT_HOST | quote }}
+  REDSHIFT_PORT:     {{ .Values.env.REDSHIFT_PORT | quote }}
+  REDSHIFT_DB:       {{ .Values.env.REDSHIFT_DB | quote }}
+  REDSHIFT_USER:     {{ .Values.env.REDSHIFT_USER | quote }}
+  REDSHIFT_PASSWORD: {{ .Values.env.REDSHIFT_PASSWORD | quote }}

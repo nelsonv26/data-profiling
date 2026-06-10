@@ -146,3 +146,69 @@ You can override the selection in the UI before running the profiler.
 ## Redshift row limit
 
 Default: **10,000 rows**. Adjustable in the UI (100 – 500,000) via the "Row limit" input.
+
+---
+
+## Kubernetes deployment
+
+Requirements: Docker, kubectl, Helm ≥ 4.2.0.
+
+### Local deployment (Docker Desktop)
+
+```bash
+# 1. Build the image
+docker build -t data-profiling:latest .
+
+# 2. Make sure docker-desktop context is active
+kubectl config use-context docker-desktop
+
+# 3. Deploy with Helm
+helm upgrade --install data-profiling charts/data-profiling \
+  --namespace data-profiling \
+  --create-namespace
+
+# 4. Verify pod is running
+kubectl get pods -n data-profiling
+
+# 5. Access the app
+kubectl port-forward svc/data-profiling 8501:8501 -n data-profiling
+# Open: http://localhost:8501
+```
+
+### Adoreal cluster deployment
+
+```bash
+# 1. Tag image for Adoreal registry (ask infra team for registry URL)
+docker tag data-profiling:latest <registry-url>/data-profiling:latest
+docker push <registry-url>/data-profiling:latest
+
+# 2. Switch to Adoreal cluster
+kubectl config use-context kubernetes-admin@kubernetes
+
+# 3. Deploy
+helm upgrade --install data-profiling charts/data-profiling \
+  --namespace data-profiling \
+  --create-namespace \
+  --set image.repository=<registry-url>/data-profiling \
+  --set image.pullPolicy=Always
+```
+
+To pass Redshift credentials at deploy time (avoid storing them in values.yaml):
+
+```bash
+helm upgrade --install data-profiling charts/data-profiling \
+  --namespace data-profiling \
+  --create-namespace \
+  --set image.repository=<registry-url>/data-profiling \
+  --set image.pullPolicy=Always \
+  --set env.REDSHIFT_HOST=your-cluster.redshift.amazonaws.com \
+  --set env.REDSHIFT_DB=your_database \
+  --set env.REDSHIFT_USER=your_user \
+  --set env.REDSHIFT_PASSWORD=your_password
+```
+
+### Uninstall
+
+```bash
+helm uninstall data-profiling -n data-profiling
+```
