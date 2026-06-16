@@ -1,196 +1,124 @@
-﻿# Adoreal Automation Tools
+# Adoreal Automation Tools
 
-Internal tooling for Adoreal's clinical operations and data engineering workflows.
-Each tool lives in its own folder and is independently deployable.
-
----
-
-## Tools in this repo
-
-| Folder | Tool | Purpose |
-|--------|------|---------|
-| `dataprofile/` | Data Profiling Tool | Data quality checks for ERP to Business Central migrations |
+Internal tooling platform for Adoreal's clinical operations and data engineering workflows.
+All tools are deployed to a shared Kubernetes cluster and accessible from a single internal URL.
 
 ---
 
-## Data Profiling Tool
+## Tools
 
-A Streamlit web app that profiles CSV, Excel, and Amazon Redshift data and generates
-downloadable quality reports (JSON and Excel). Built for validating clinic patient data
-before migrating it into Business Central.
+| Folder | Tool | Stack | Path | Status |
+|--------|------|-------|------|--------|
+| `dataprofile/` | Data Profiling Tool | Streamlit / Python | `/dataprofile/` | ✅ Live (local) |
+| `portal/` | Automation Portal | Next.js | `/` | 🔧 In development |
 
-### What it checks
+> To add a new tool, follow **[TOOL_TEMPLATE.md](./TOOL_TEMPLATE.md)**.
 
-| # | Check | Detail |
-|---|-------|--------|
-| 1 | **Data type detection** | Classifies each column as INTEGER, FLOAT, DATETIME, VARCHAR, or BOOLEAN |
-| 2 | **Record count** | Total row count of the file or table |
-| 3 | **Full-row duplicates** | Records that are identical across every column -- count and % |
-| 4 | **Business-key duplicates** | Records sharing the same value in identity columns (phone, email, ID, etc.) -- count and % |
-| 5 | **DOB > 100 years** | Birth dates older than 100 years -- likely data entry errors |
-| 6 | **DOB < 18 years** | Birth dates younger than 18 years -- flagged as a warning |
-| 7 | **Null values** | % of missing values per column, colour-coded by severity |
+---
 
-#### Quality gate thresholds
+## Repository structure
 
-| Severity | Condition |
-|----------|-----------|
-| ERROR | Nulls > 20% in any column |
-| ERROR | Full-row duplicates > 5% |
-| ERROR | Business-key duplicates > 5% |
-| ERROR | Any DOB record older than 100 years |
-| WARNING | DOB < 18 years > 2% |
-
-### How to run locally
-
-**Requirements:** Python 3.11+
-
-```bash
-# 1. Navigate to the app folder
-cd dataprofile
-
-# 2. Create and activate a virtual environment
-python -m venv .venv
-
-# Windows
-.venv\Scripts\activate
-# macOS / Linux
-source .venv/bin/activate
-
-# 3. Install dependencies
-pip install -r requirements.txt
-
-# 4. (Optional) Set Redshift credentials -- Windows PowerShell
-$env:REDSHIFT_HOST     = "your-cluster.us-east-1.redshift.amazonaws.com"
-$env:REDSHIFT_PORT     = "5439"
-$env:REDSHIFT_DB       = "your_database"
-$env:REDSHIFT_USER     = "your_username"
-$env:REDSHIFT_PASSWORD = "your_password"
-
-# 5. Launch
-streamlit run app.py
+```
+adoreal-tools/
+├── .github/
+│   └── workflows/
+│       ├── ci.yml                   # build + helm lint on every PR
+│       └── deploy-{app}.yml         # per-tool deploy on push to main
+│
+├── charts/                          # Helm charts — one per tool
+│   ├── _common/                     # shared helpers
+│   ├── portal/
+│   └── dataprofile/
+│
+├── k8s/                             # shared Kubernetes manifests
+│   ├── namespace.yaml
+│   └── ingress.yaml                 # Nginx Ingress — routes all tools
+│
+├── scripts/                         # operational scripts
+│   ├── deploy.ps1                   # build + deploy any tool locally
+│   └── stop.ps1                     # teardown any tool locally
+│
+├── portal/                          # Next.js portal (tool launcher)
+├── dataprofile/                     # Data Profiling Tool
+├── {your-tool}/                     # future tools follow the same pattern
+│
+├── TOOL_TEMPLATE.md                 # guide for adding new tools
+└── README.md
 ```
 
-The app opens at **http://localhost:8501**.
+---
+
+## Running a tool locally (Kubernetes)
+
+```powershell
+# Deploy any tool — replace 'dataprofile' with the tool folder name
+.\scripts\deploy.ps1 -AppName dataprofile
+
+# Stop a tool (keeps namespace and other tools running)
+.\scripts\stop.ps1 -AppName dataprofile
+
+# Stop + delete namespace (use only if no other tools are running in it)
+.\scripts\stop.ps1 -AppName dataprofile -DeleteNamespace
+```
+
+The script auto-detects the port from `charts/{AppName}/values.yaml`.
+Override it with `-Port 8000` if needed.
 
 ---
 
-## Kubernetes deployment
+## Kubernetes architecture
 
-**Requirements:** Docker, kubectl, Helm >= 4.2.0.
+```
+Browser
+  │
+  ▼
+Ingress (nginx)  ──►  /                  →  portal        (port 3000)
+                 ──►  /dataprofile/      →  dataprofile   (port 8501)
+                 ──►  /{tool-name}/      →  {tool-name}   (port varies)
 
-### Local deployment (Docker Desktop)
-
-```bash
-# 1. Build the image (run from repo root)
-docker build -t data-profiling:latest .
-
-# 2. Switch to the Docker Desktop context
-kubectl config use-context docker-desktop
-
-# 3. Deploy with Helm
-helm upgrade --install data-profiling charts/data-profiling \
-  --namespace data-profiling \
-  --create-namespace
-
-# 4. Verify the pod is running
-kubectl get pods -n data-profiling
-
-# 5. Access the app
-kubectl port-forward svc/data-profiling 8501:8501 -n data-profiling
-# Open: http://localhost:8501
+Namespace: tools-prod (production)
+           tools-dev  (dev / staging)
 ```
 
-### Adoreal cluster deployment
+All tools share a single namespace per environment.
+Each tool has its own Deployment, Service, and Helm chart.
 
-```bash
-# 1. Tag and push the image (ask infra for the registry URL)
-docker tag data-profiling:latest <registry-url>/data-profiling:latest
-docker push <registry-url>/data-profiling:latest
+---
 
-# 2. Switch to the Adoreal cluster
+## Deploying to the Adoreal cluster (production)
+
+```powershell
+# 1. Tag and push image to registry (ask infra for the URL)
+docker tag dataprofile:latest <registry-url>/dataprofile:latest
+docker push <registry-url>/dataprofile:latest
+
+# 2. Switch context
 kubectl config use-context kubernetes-admin@kubernetes
 
-# 3. Deploy -- pass credentials at install time, not stored in values.yaml
-helm upgrade --install data-profiling charts/data-profiling \
-  --namespace data-profiling \
-  --create-namespace \
-  --set image.repository=<registry-url>/data-profiling \
-  --set image.pullPolicy=Always \
-  --set env.REDSHIFT_HOST=your-cluster.redshift.amazonaws.com \
-  --set env.REDSHIFT_DB=your_database \
-  --set env.REDSHIFT_USER=your_user \
-  --set env.REDSHIFT_PASSWORD=your_password
-```
-
-### Uninstall
-
-```bash
-helm uninstall data-profiling -n data-profiling
-```
-
-### Helm chart layout
-
-```
-charts/
-+-- data-profiling/
-    +-- Chart.yaml
-    +-- values.yaml          # defaults -- override with --set at deploy time
-    +-- templates/
-        +-- _helpers.tpl
-        +-- namespace.yaml
-        +-- configmap.yaml   # Redshift env vars
-        +-- deployment.yaml  # readiness + liveness probes on /_stcore/health
-        +-- service.yaml
+# 3. Deploy with production values
+helm upgrade --install dataprofile charts/dataprofile `
+  --namespace tools-prod `
+  --create-namespace `
+  -f charts/dataprofile/values-prod.yaml
 ```
 
 ---
 
 ## Adding a new tool
 
-Each tool is a self-contained folder at the repo root. Follow this pattern:
+See **[TOOL_TEMPLATE.md](./TOOL_TEMPLATE.md)** for the full step-by-step guide.
+Quick checklist:
 
-### 1. Create the tool folder
+1. Create `your-tool/` folder with code + `Dockerfile`
+2. Copy `charts/dataprofile/` → `charts/your-tool/` and update `Chart.yaml` + `values.yaml`
+3. Add a path entry to `k8s/ingress.yaml`
+4. Add a card to `portal/src/app/page.tsx`
+5. Run `.\scripts\deploy.ps1 -AppName your-tool` and verify end-to-end
 
-```
-my-tool/
-+-- app.py              # or main.py, index.ts, etc.
-+-- requirements.txt    # or package.json
-+-- README.md           # tool-specific docs
-```
+---
 
-### 2. Add a Dockerfile
+## Documentation
 
-For a single containerised tool, add `Dockerfile` at the repo root and build with:
-
-```bash
-docker build -t my-tool:latest .
-```
-
-If the repo grows to multiple containerised tools, move the Dockerfile inside the
-tool folder (`my-tool/Dockerfile`) and build scoped to that folder:
-
-```bash
-docker build -f my-tool/Dockerfile -t my-tool:latest .
-```
-
-### 3. Add a Helm chart
-
-Copy the existing chart as a starting point:
-
-```bash
-cp -r charts/data-profiling charts/my-tool
-```
-
-Update `charts/my-tool/Chart.yaml` (name, version) and `charts/my-tool/values.yaml`
-(image, ports, env vars), then deploy:
-
-```bash
-helm upgrade --install my-tool charts/my-tool \
-  --namespace my-tool \
-  --create-namespace
-```
-
-### 4. Update this README
-
-Add a row to the **Tools in this repo** table at the top of this file.
+- [PRD](https://adoreal.atlassian.net/wiki/spaces/Automation/pages/516358148) — Product Requirements Document
+- [TRD](https://adoreal.atlassian.net/wiki/spaces/Automation/pages/516358168) — Technical Requirements Document
+- [Jira board](https://adoreal.atlassian.net/jira/software/projects/AUTO/boards/34/backlog) — AUTO project backlog
